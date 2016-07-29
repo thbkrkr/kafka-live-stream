@@ -1,0 +1,200 @@
+<!doctype html>
+<html><head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Kafka Live Streaming</title>
+  <link rel="icon" href="/s/favicon.ico" type="image/gif">
+  <link rel="stylesheet" type="text/css" href="//cdnjs.cloudflare.com/ajax/libs/semantic-ui/2.2.2/semantic.min.css">
+  <!--
+  <link rel="stylesheet" href="http://github.hubspot.com/odometer/themes/odometer-theme-minimal.css" />
+  -->
+</head><body>
+<style>
+.main {
+  padding-top: 10%;
+}
+.button {
+  margin-top: 2em;
+}
+.counters {
+  font-size: 3em;
+  line-height: 1.5em;
+}
+.total {
+  color: #2196f3;
+}
+.rate {
+  color: #3F51B5;
+}
+.footer {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  padding: 20px;
+  text-align: center;
+}
+.post-example {
+  background: #FFF;
+  position: absolute;
+  top: 50px;
+  width: 100%;
+  padding: 50px;
+  text-align: center;
+  z-index: 2;
+}
+.post-example > textarea {
+  font-size: 1em;
+  width: 500px;
+  height: 130px;
+  padding: 20px;
+  resize: none;
+  color: #E03997!important;
+  border-radius: .28571429rem;
+}
+.show-example {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+}
+
+</style>
+<!-- begin:HTML -->
+<div class="ui main center aligned container">
+
+  <div class="zone-form">
+    <h1 class="ui header index">
+      Kafka Live Streaming</a>
+    </h1>
+
+    <div class="ui form">
+      <div class="three fields">
+        <div class="field">
+          <label for="region">Region</label>
+          <select id="region" name="region">
+            <option value="gra.queue.ovh.net">GRA</option>
+            <option value="rbx.queue.ovh.net">RBX</option>
+            <option value="sbg.queue.ovh.net">SBG</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Key</label>
+          <input type="text" name="key" id="key" placeholder="<keyID>-<keySecret>">
+        </div>
+        <div class="field">
+          <label>Topic</label>
+          <input type="text" name="topic" id="topic" placeholder="<appID>.<topicID>">
+        </div>
+      </div>
+    </div>
+
+    <button class="ui primary basic button stream">Stream your topic</button>
+  </div>
+
+</div>
+
+<div class="footer">
+  <hr>
+  <a href="https://www.runabove.com/dbaas-queue.xml" target="_blank">OVH DBaaS Queue</a>
+  - Real-time reliable messaging and data streaming
+</div>
+
+<div class="post-example" style="display:none">
+  <textarea onclick="this.select()" id="curl"></textarea>
+</div>
+
+</body> <!-- end:HTML -->
+<!--
+<script src="//cdnjs.cloudflare.com/ajax/libs/odometer.js/0.4.7/odometer.min.js"></script>
+-->
+<script src="//thbkrkr.github.io/s.js/dist/s.5.f1202eb.js"></script><script>
+/** begin:JS */
+
+var odometer;
+
+b = $lsGet('b')
+$('#region').val(b)
+k = $lsGet('k')
+$('#key').val(k)
+t = $lsGet('t')
+$('#topic').val(t)
+
+function stream() {
+  total = 0
+  last = 0
+  rate = 0
+
+  b = $('#region').val()
+  k = $('#key').val()
+  t = $('#topic').val()
+  $lsSet('b', b)
+  $lsSet('k', k)
+  $lsSet('t', t)
+
+  $('.container').html(`
+    <div class="counters">
+      <div class="total odometer"><span id="total"></span> messages</div>
+      <div class="rate"><span id="rate"></span> messages/s</div>
+    </div>
+    <div class="show-example">
+      <button class="tiny ui pink basic button">Send a message</button>
+    </div>
+  `)
+
+  $('#curl').val(`curl \
+    -H "X-Ovh-Queue-Token: `+k+`" \
+    -XPOST "https://`+b+`/topic/`+t+`" \
+    -d '[{"Value": "'$(date +%s)'"}]'`)
+
+  $('.show-example').on('click', function() {
+    $('.post-example').toggle()
+    btn = $('.show-example > button')
+    if (btn.html() == 'Send a message') {
+      btn.html('Close')
+    } else {
+      btn.html('Send a message')
+    }
+  })
+
+  //setupOdometer()
+
+  setInterval(function() {
+    document.getElementById('total').innerHTML = total
+    //odometer.update(total)
+  }, 50)
+
+  setInterval(function() {
+    rate = total - last
+    last = total
+    document.getElementById('rate').innerHTML = rate
+  }, 1000)
+
+  es = new EventSource('/stream?b=' + b + ':9092&k=' + k + '&t=' + t)
+  es.onmessage = function(event) {
+    total++
+  }
+}
+
+function setupOdometer() {
+  el = document.querySelector('#total');
+  odometer = new Odometer({
+    el: el,
+    value: 0,
+    duration: 200,
+    format: '',
+    theme: 'minimal'
+  });
+
+  el.innerHTML = 0
+}
+
+$('.showForm').on('click', function() {
+  $('.zone-header').hide()
+  $('.zone-form').show()
+})
+
+
+$('.stream').on('click', stream)
+
+/** end:JS */
+</script></body></html>
