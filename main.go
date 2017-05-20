@@ -5,6 +5,7 @@ import (
 	"io"
 	"math/rand"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -19,10 +20,11 @@ var (
 	gitCommit = "dev"
 
 	name = "kafka-live-stream"
+	port = 4242
 )
 
 func main() {
-	http.API(name, buildDate, gitCommit, routes)
+	http.API(name, buildDate, gitCommit, port, routes)
 }
 
 func routes(r *gin.Engine) {
@@ -31,24 +33,29 @@ func routes(r *gin.Engine) {
 
 func stream(c *gin.Context) {
 	brokers := c.Query("b")
-	key := c.Query("k")
 	topic := c.Query("t")
+	user := c.Query("u")
+	password := c.Query("p")
 
-	if brokers == "" || key == "" || topic == "" {
+	if brokers == "" || topic == "" || user == "" || password == "" {
 		fmt.Println("Invalid params")
 		c.JSON(400, gin.H{"error": "Missing parameter"})
 		return
 	}
 
-	consumerGID := name + fmt.Sprintf("%d-%d", time.Now().Unix(), rand.Intn(10000))
-
 	// Init config
 	clusterConfig := cluster.NewConfig()
-	clusterConfig.ClientID = key
+	clusterConfig.ClientID = user
+	clusterConfig.Net.TLS.Enable = true
+	clusterConfig.Net.SASL.Enable = true
+	clusterConfig.Net.SASL.User = user
+	clusterConfig.Net.SASL.Password = password
+
 	clusterConfig.Consumer.Return.Errors = true
 	clusterConfig.Group.Return.Notifications = true
-	clusterConfig.Version = sarama.V0_9_0_1
+	clusterConfig.Version = sarama.V0_10_1_0
 	clusterConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
+	consumerGID := user + "." + name + "." + fmt.Sprintf("%d-%d", time.Now().Unix(), rand.Intn(10000))
 
 	// Init consumer
 	consumer, err := cluster.NewConsumer(strings.Split(brokers, ","), consumerGID, []string{topic}, clusterConfig)
@@ -66,7 +73,7 @@ func stream(c *gin.Context) {
 	// Consumer errors
 	go func() {
 		for err := range consumer.Errors() {
-			logrus.Printf("Error: %s\n", err.Error())
+			logrus.WithError(err).Error("Fail to consume")
 		}
 	}()
 
@@ -77,8 +84,25 @@ func stream(c *gin.Context) {
 		}
 	}()
 
+	var msgs uint64
+
+	go func() {
+		for range consumer.Messages() {
+			atomic.AddUint64(&msgs, 1)
+		}
+	}()
+
+	sseChan := make(chan uint64)
+
+	go func() {
+		tick := time.NewTicker(time.Millisecond * 50)
+		for range tick.C {
+			sseChan <- msgs
+		}
+	}()
+
 	c.Stream(func(w io.Writer) bool {
-		c.SSEvent("message", <-consumer.Messages())
+		c.SSEvent("message", <-sseChan)
 		return true
 	})
 }
