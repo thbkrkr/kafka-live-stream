@@ -104,13 +104,13 @@ func (c *Consumer) Notifications() <-chan *Notification { return c.notifications
 // your application crashes. This means that you may end up processing the same
 // message twice, and your processing should ideally be idempotent.
 func (c *Consumer) MarkOffset(msg *sarama.ConsumerMessage, metadata string) {
-	c.subs.Fetch(msg.Topic, msg.Partition).MarkOffset(msg.Offset, metadata)
+	c.subs.Fetch(msg.Topic, msg.Partition).MarkOffset(msg.Offset+1, metadata)
 }
 
 // MarkPartitionOffset marks an offset of the provided topic/partition as processed.
 // See MarkOffset for additional explanation.
 func (c *Consumer) MarkPartitionOffset(topic string, partition int32, offset int64, metadata string) {
-	c.subs.Fetch(topic, partition).MarkOffset(offset, metadata)
+	c.subs.Fetch(topic, partition).MarkOffset(offset+1, metadata)
 }
 
 // Subscriptions returns the consumed topics and partitions
@@ -131,11 +131,15 @@ func (c *Consumer) CommitOffsets() error {
 		RetentionTime:           -1,
 	}
 
+	if rt := c.client.config.Consumer.Offsets.Retention; rt != 0 {
+		req.RetentionTime = int64(rt / time.Millisecond)
+	}
+
 	var dirty bool
 	snap := c.subs.Snapshot()
 	for tp, state := range snap {
 		if state.Dirty {
-			req.AddBlock(tp.Topic, tp.Partition, state.Info.Offset+1, 0, state.Info.Metadata)
+			req.AddBlock(tp.Topic, tp.Partition, state.Info.Offset, 0, state.Info.Metadata)
 			dirty = true
 		}
 	}
@@ -145,11 +149,13 @@ func (c *Consumer) CommitOffsets() error {
 
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return err
 	}
 
 	resp, err := broker.CommitOffset(req)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return err
 	}
 
@@ -201,6 +207,13 @@ func (c *Consumer) mainLoop() {
 	for {
 		atomic.StoreInt32(&c.consuming, 0)
 
+		// Check if close was requested
+		select {
+		case <-c.dying:
+			return
+		default:
+		}
+
 		// Remember previous subscriptions
 		var notification *Notification
 		if c.client.config.Group.Return.Notifications {
@@ -215,7 +228,7 @@ func (c *Consumer) mainLoop() {
 		}
 
 		// Start the heartbeat
-		hbStop, hbDone := make(chan struct{}), make(chan struct{})
+		hbStop, hbDone := make(chan none), make(chan none)
 		go c.hbLoop(hbStop, hbDone)
 
 		// Subscribe to topic/partitions
@@ -227,7 +240,7 @@ func (c *Consumer) mainLoop() {
 		}
 
 		// Start consuming and comitting offsets
-		cmStop, cmDone := make(chan struct{}), make(chan struct{})
+		cmStop, cmDone := make(chan none), make(chan none)
 		go c.cmLoop(cmStop, cmDone)
 		atomic.StoreInt32(&c.consuming, 1)
 
@@ -256,7 +269,7 @@ func (c *Consumer) mainLoop() {
 }
 
 // heartbeat loop, triggered by the mainLoop
-func (c *Consumer) hbLoop(stop <-chan struct{}, done chan<- struct{}) {
+func (c *Consumer) hbLoop(stop <-chan none, done chan<- none) {
 	defer close(done)
 
 	ticker := time.NewTicker(c.client.config.Group.Heartbeat.Interval)
@@ -280,7 +293,7 @@ func (c *Consumer) hbLoop(stop <-chan struct{}, done chan<- struct{}) {
 }
 
 // commit loop, triggered by the mainLoop
-func (c *Consumer) cmLoop(stop <-chan struct{}, done chan<- struct{}) {
+func (c *Consumer) cmLoop(stop <-chan none, done chan<- none) {
 	defer close(done)
 
 	ticker := time.NewTicker(c.client.config.Consumer.Offsets.CommitInterval)
@@ -303,12 +316,17 @@ func (c *Consumer) rebalanceError(err error, notification *Notification) {
 	if c.client.config.Group.Return.Notifications {
 		c.notifications <- notification
 	}
+
 	switch err {
 	case sarama.ErrRebalanceInProgress:
 	default:
 		c.handleError(&Error{Ctx: "rebalance", error: err})
 	}
-	time.Sleep(c.client.config.Metadata.Retry.Backoff)
+
+	select {
+	case <-c.dying:
+	case <-time.After(c.client.config.Metadata.Retry.Backoff):
+	}
 }
 
 func (c *Consumer) handleError(e *Error) {
@@ -325,21 +343,19 @@ func (c *Consumer) handleError(e *Error) {
 
 // Releases the consumer and commits offsets, called from rebalance() and Close()
 func (c *Consumer) release() (err error) {
-	// Stop all consumers, don't stop on errors
-	if e := c.subs.Stop(); e != nil {
-		err = e
-	}
+	// Stop all consumers
+	c.subs.Stop()
+
+	// Clear subscriptions on exit
+	defer c.subs.Clear()
 
 	// Wait for messages to be processed
 	time.Sleep(c.client.config.Consumer.MaxProcessingTime)
 
-	// Commit offsets
+	// Commit offsets, continue on errors
 	if e := c.commitOffsetsWithRetry(c.client.config.Group.Offsets.Retry.Max); e != nil {
 		err = e
 	}
-
-	// Clear subscriptions
-	c.subs.Clear()
 
 	return
 }
@@ -350,6 +366,7 @@ func (c *Consumer) release() (err error) {
 func (c *Consumer) heartbeat() error {
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return err
 	}
 
@@ -359,6 +376,7 @@ func (c *Consumer) heartbeat() error {
 		GenerationId: c.generationID,
 	})
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return err
 	}
 	return resp.Err
@@ -409,17 +427,32 @@ func (c *Consumer) subscribe(subs map[string][]int32) error {
 		return err
 	}
 
-	// Create consumers
+	// create consumers in parallel
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
 	for topic, partitions := range subs {
 		for _, partition := range partitions {
-			if err := c.createConsumer(topic, partition, offsets[topic][partition]); err != nil {
-				_ = c.release()
-				_ = c.leaveGroup()
-				return err
-			}
+			wg.Add(1)
+
+			info := offsets[topic][partition]
+			go func(t string, p int32) {
+				if e := c.createConsumer(t, p, info); e != nil {
+					mu.Lock()
+					err = e
+					mu.Unlock()
+				}
+				wg.Done()
+			}(topic, partition)
 		}
 	}
-	return nil
+	wg.Wait()
+
+	if err != nil {
+		_ = c.release()
+		_ = c.leaveGroup()
+	}
+	return err
 }
 
 // --------------------------------------------------------------------
@@ -448,13 +481,16 @@ func (c *Consumer) joinGroup() (*balancer, error) {
 
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return nil, err
 	}
 
 	resp, err := broker.JoinGroup(req)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return nil, err
 	} else if resp.Err != sarama.ErrNoError {
+		c.closeCoordinator(broker, resp.Err)
 		return nil, resp.Err
 	}
 
@@ -497,23 +533,26 @@ func (c *Consumer) syncGroup(strategy *balancer) (map[string][]int32, error) {
 
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return nil, err
 	}
 
-	sync, err := broker.SyncGroup(req)
+	resp, err := broker.SyncGroup(req)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return nil, err
-	} else if sync.Err != sarama.ErrNoError {
-		return nil, sync.Err
+	} else if resp.Err != sarama.ErrNoError {
+		c.closeCoordinator(broker, resp.Err)
+		return nil, resp.Err
 	}
 
 	// Return if there is nothing to subscribe to
-	if len(sync.MemberAssignment) == 0 {
+	if len(resp.MemberAssignment) == 0 {
 		return nil, nil
 	}
 
 	// Get assigned subscriptions
-	members, err := sync.GetMemberAssignment()
+	members, err := resp.GetMemberAssignment()
 	if err != nil {
 		return nil, err
 	}
@@ -546,11 +585,13 @@ func (c *Consumer) fetchOffsets(subs map[string][]int32) (map[string]map[int32]o
 
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return nil, err
 	}
 
 	resp, err := broker.FetchOffset(req)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return nil, err
 	}
 
@@ -575,13 +616,16 @@ func (c *Consumer) fetchOffsets(subs map[string][]int32) (map[string]map[int32]o
 func (c *Consumer) leaveGroup() error {
 	broker, err := c.client.Coordinator(c.groupID)
 	if err != nil {
+		c.closeCoordinator(broker, err)
 		return err
 	}
 
-	_, err = broker.LeaveGroup(&sarama.LeaveGroupRequest{
+	if _, err = broker.LeaveGroup(&sarama.LeaveGroupRequest{
 		GroupId:  c.groupID,
 		MemberId: c.memberID,
-	})
+	}); err != nil {
+		c.closeCoordinator(broker, err)
+	}
 	return err
 }
 
@@ -608,8 +652,18 @@ func (c *Consumer) createConsumer(topic string, partition int32, info offsetInfo
 func (c *Consumer) commitOffsetsWithRetry(retries int) error {
 	err := c.CommitOffsets()
 	if err != nil && retries > 0 && c.subs.HasDirty() {
-		_ = c.client.RefreshCoordinator(c.groupID)
 		return c.commitOffsetsWithRetry(retries - 1)
 	}
 	return err
+}
+
+func (c *Consumer) closeCoordinator(broker *sarama.Broker, err error) {
+	if broker != nil {
+		_ = broker.Close()
+	}
+
+	switch err {
+	case sarama.ErrConsumerCoordinatorNotAvailable, sarama.ErrNotCoordinatorForConsumer:
+		_ = c.client.RefreshCoordinator(c.groupID)
+	}
 }

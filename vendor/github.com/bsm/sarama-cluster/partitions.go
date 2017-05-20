@@ -11,7 +11,7 @@ type partitionConsumer struct {
 	pcm sarama.PartitionConsumer
 
 	state partitionState
-	mutex sync.Mutex
+	mu    sync.Mutex
 
 	closed      bool
 	dying, dead chan none
@@ -39,46 +39,45 @@ func newPartitionConsumer(manager sarama.Consumer, topic string, partition int32
 }
 
 func (c *partitionConsumer) Loop(messages chan<- *sarama.ConsumerMessage, errors chan<- error) {
+	defer close(c.dead)
+
 	for {
 		select {
-		case msg := <-c.pcm.Messages():
-			if msg != nil {
-				select {
-				case messages <- msg:
-				case <-c.dying:
-					close(c.dead)
-					return
-				}
+		case msg, ok := <-c.pcm.Messages():
+			if !ok {
+				return
 			}
-		case err := <-c.pcm.Errors():
-			if err != nil {
-				select {
-				case errors <- err:
-				case <-c.dying:
-					close(c.dead)
-					return
-				}
+			select {
+			case messages <- msg:
+			case <-c.dying:
+				return
+			}
+		case err, ok := <-c.pcm.Errors():
+			if !ok {
+				return
+			}
+			select {
+			case errors <- err:
+			case <-c.dying:
+				return
 			}
 		case <-c.dying:
-			close(c.dead)
 			return
 		}
 	}
 }
 
-func (c *partitionConsumer) Close() (err error) {
+func (c *partitionConsumer) Close() error {
 	if c.closed {
-		return
+		return nil
 	}
 
+	err := c.pcm.Close()
 	c.closed = true
 	close(c.dying)
 	<-c.dead
 
-	if e := c.pcm.Close(); e != nil {
-		err = e
-	}
-	return
+	return err
 }
 
 func (c *partitionConsumer) State() partitionState {
@@ -86,9 +85,9 @@ func (c *partitionConsumer) State() partitionState {
 		return partitionState{}
 	}
 
-	c.mutex.Lock()
+	c.mu.Lock()
 	state := c.state
-	c.mutex.Unlock()
+	c.mu.Unlock()
 
 	return state
 }
@@ -98,11 +97,11 @@ func (c *partitionConsumer) MarkCommitted(offset int64) {
 		return
 	}
 
-	c.mutex.Lock()
+	c.mu.Lock()
 	if offset == c.state.Info.Offset {
 		c.state.Dirty = false
 	}
-	c.mutex.Unlock()
+	c.mu.Unlock()
 }
 
 func (c *partitionConsumer) MarkOffset(offset int64, metadata string) {
@@ -110,13 +109,13 @@ func (c *partitionConsumer) MarkOffset(offset int64, metadata string) {
 		return
 	}
 
-	c.mutex.Lock()
+	c.mu.Lock()
 	if offset > c.state.Info.Offset {
 		c.state.Info.Offset = offset
 		c.state.Info.Metadata = metadata
 		c.state.Dirty = true
 	}
-	c.mutex.Unlock()
+	c.mu.Unlock()
 }
 
 // --------------------------------------------------------------------
@@ -129,8 +128,8 @@ type partitionState struct {
 // --------------------------------------------------------------------
 
 type partitionMap struct {
-	data  map[topicPartition]*partitionConsumer
-	mutex sync.RWMutex
+	data map[topicPartition]*partitionConsumer
+	mu   sync.RWMutex
 }
 
 func newPartitionMap() *partitionMap {
@@ -140,21 +139,21 @@ func newPartitionMap() *partitionMap {
 }
 
 func (m *partitionMap) Fetch(topic string, partition int32) *partitionConsumer {
-	m.mutex.RLock()
+	m.mu.RLock()
 	pc, _ := m.data[topicPartition{topic, partition}]
-	m.mutex.RUnlock()
+	m.mu.RUnlock()
 	return pc
 }
 
 func (m *partitionMap) Store(topic string, partition int32, pc *partitionConsumer) {
-	m.mutex.Lock()
+	m.mu.Lock()
 	m.data[topicPartition{topic, partition}] = pc
-	m.mutex.Unlock()
+	m.mu.Unlock()
 }
 
 func (m *partitionMap) HasDirty() bool {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	for _, pc := range m.data {
 		if state := pc.State(); state.Dirty {
@@ -165,8 +164,8 @@ func (m *partitionMap) HasDirty() bool {
 }
 
 func (m *partitionMap) Snapshot() map[topicPartition]partitionState {
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	snap := make(map[topicPartition]partitionState, len(m.data))
 	for tp, pc := range m.data {
@@ -175,40 +174,36 @@ func (m *partitionMap) Snapshot() map[topicPartition]partitionState {
 	return snap
 }
 
-func (m *partitionMap) Stop() (err error) {
-	m.mutex.RLock()
-	size := len(m.data)
-	errs := make(chan error, size)
+func (m *partitionMap) Stop() {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var wg sync.WaitGroup
 	for tp := range m.data {
+		wg.Add(1)
 		go func(p *partitionConsumer) {
-			errs <- p.Close()
+			_ = p.Close()
+			wg.Done()
 		}(m.data[tp])
 	}
-	m.mutex.RUnlock()
-
-	for i := 0; i < size; i++ {
-		if e := <-errs; e != nil {
-			err = e
-		}
-	}
-	return
+	wg.Wait()
 }
 
 func (m *partitionMap) Clear() {
-	m.mutex.Lock()
+	m.mu.Lock()
 	for tp := range m.data {
 		delete(m.data, tp)
 	}
-	m.mutex.Unlock()
+	m.mu.Unlock()
 }
 
 func (m *partitionMap) Info() map[string][]int32 {
 	info := make(map[string][]int32)
-	m.mutex.RLock()
+	m.mu.RLock()
 	for tp := range m.data {
 		info[tp.Topic] = append(info[tp.Topic], tp.Partition)
 	}
-	m.mutex.RUnlock()
+	m.mu.RUnlock()
 
 	for topic := range info {
 		sort.Sort(int32Slice(info[topic]))
